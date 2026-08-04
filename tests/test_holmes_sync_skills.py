@@ -97,10 +97,30 @@ def test_missing_cluster_name_skips_entirely(tmp_path: Path):
     dal.sync_skills.assert_not_called()
 
 
-def test_loader_failure_never_raises(tmp_path: Path):
+def test_sync_failure_never_raises(tmp_path: Path):
     """A display-only mirror must never prevent Holmes from starting."""
     dal = _dal()
     dal.sync_skills.side_effect = RuntimeError("boom")
 
     _write_skill(tmp_path, "alpha")
     holmes_sync_skills_status(dal, _config([tmp_path]))
+
+
+def test_loader_failure_never_raises_and_skips_the_write(monkeypatch, tmp_path: Path):
+    """The loader runs BEFORE the rows are built, so its failure is a separate path.
+
+    Must not raise, and must not reach sync_skills at all -- with no loaded skills and no
+    health signal there is nothing to upsert and pruning would be a guess.
+    """
+    dal = _dal()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("loader exploded")
+
+    monkeypatch.setattr(
+        "holmes.utils.holmes_sync_skills.load_filesystem_skills", boom
+    )
+
+    holmes_sync_skills_status(dal, _config([tmp_path]))
+
+    dal.sync_skills.assert_not_called()

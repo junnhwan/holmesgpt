@@ -189,13 +189,27 @@ def scan_skill_directory(
             problems.append(f"skill directory does not exist: {directory}")
         return skills
 
+    def on_walk_error(error: OSError) -> None:
+        """os.walk swallows traversal errors unless this is passed.
+
+        Without it, a directory that exists but cannot be read into yields nothing and
+        records nothing -- and `is_dir()` above succeeds for such a directory, so the whole
+        scan looks like "readable and genuinely empty". For a caller that DELETES based on
+        what loaded that is the worst possible confusion: the mirror would prune rows for
+        skills that are still on disk and merely unreadable this cycle. Applies to nested
+        directories too, not just the root.
+        """
+        logging.warning(f"Failed to read skill directory {error.filename}: {error}")
+        if problems is not None:
+            problems.append(f"failed to read skill directory {error.filename}: {error}")
+
     # followlinks=True so we traverse Kubernetes ConfigMap mounts, which
     # surface each key as `<dir>/<name>` -> `..data/<name>` -> a real file
     # under a timestamped `..NNN/` directory. Depth is computed against the
     # walked (unresolved) path so the symlink-traversed path is at depth 1,
     # not depth 2 from the resolved `..NNN/` real dir.
     seen_paths: set[str] = set()
-    for root, dirs, files in os.walk(directory, followlinks=True):
+    for root, dirs, files in os.walk(directory, followlinks=True, onerror=on_walk_error):
         depth = len(Path(root).relative_to(directory).parts)
         if depth >= max_depth:
             dirs.clear()

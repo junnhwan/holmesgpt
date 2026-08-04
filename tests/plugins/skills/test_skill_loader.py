@@ -73,6 +73,39 @@ def test_scan_skill_directory_missing_dir(tmp_path: Path):
     assert skills == []
 
 
+def _deny_scandir_under(root: Path, monkeypatch):
+    """Make os.scandir raise PermissionError for paths under `root`, leaving others alone.
+
+    Portable stand-in for a chmod 000 directory: chmod is a no-op for the owner on Windows
+    and ineffective as root, which is how CI runs.
+    """
+    real_scandir = os.scandir
+
+    def deny(path, *args, **kwargs):
+        if str(path).startswith(str(root)):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", deny)
+
+
+def test_scan_skill_directory_reports_unreadable_directory(tmp_path: Path, monkeypatch):
+    """An existing but UNREADABLE directory must be reported as a problem.
+
+    os.walk swallows traversal errors unless an `onerror` handler is passed, and `is_dir()`
+    succeeds for a directory you cannot read into. Without onerror this returns [] with no
+    problem recorded -- indistinguishable from "readable and genuinely empty", which is
+    exactly the distinction the mirror prunes on.
+    """
+    _deny_scandir_under(tmp_path, monkeypatch)
+    problems: list[str] = []
+
+    skills = scan_skill_directory(tmp_path, problems=problems)
+
+    assert skills == []
+    assert problems, "an unreadable directory must be recorded as a problem"
+
+
 def test_scan_skill_directory_respects_max_depth(tmp_path: Path):
     # SKILL.md at depth 3 should be ignored with default max_depth=2.
     _write_skill(tmp_path / "a" / "b" / "c", "deep")
@@ -179,6 +212,20 @@ class TestLoadFilesystemSkills:
         broken = tmp_path / "broken"
         broken.mkdir()
         (broken / "SKILL.md").write_text("no frontmatter here")
+
+        loaded = load_filesystem_skills(custom_skill_paths=[tmp_path])
+
+        assert loaded.sources_ok is False
+        assert loaded.skills == []
+
+    def test_unreadable_directory_reports_not_ok(self, tmp_path: Path, monkeypatch):
+        """The dangerous case: the path exists so `is_dir()` passes, but it cannot be read.
+
+        If this reported ok, the mirror would prune rows for skills that are still on disk
+        and merely unreadable this cycle -- the precise wrongful delete sources_ok exists to
+        prevent.
+        """
+        _deny_scandir_under(tmp_path, monkeypatch)
 
         loaded = load_filesystem_skills(custom_skill_paths=[tmp_path])
 
