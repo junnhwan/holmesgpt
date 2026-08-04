@@ -105,6 +105,11 @@ def test_sync_failure_never_raises(tmp_path: Path):
     _write_skill(tmp_path, "alpha")
     holmes_sync_skills_status(dal, _config([tmp_path]))
 
+    # Assert the call happened, otherwise the side_effect never fires and this passes
+    # vacuously -- it would still be green if the sync were skipped entirely, proving
+    # nothing about suppression.
+    dal.sync_skills.assert_called_once()
+
 
 def test_loader_failure_never_raises_and_skips_the_write(monkeypatch, tmp_path: Path):
     """The loader runs BEFORE the rows are built, so its failure is a separate path.
