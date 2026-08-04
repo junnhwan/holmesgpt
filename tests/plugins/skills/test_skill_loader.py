@@ -3,6 +3,7 @@ from pathlib import Path
 
 from holmes.plugins.skills.skill_loader import (
     SkillSource,
+    load_filesystem_skills,
     load_skill_catalog,
     scan_skill_directory,
 )
@@ -135,3 +136,82 @@ def test_load_skill_catalog_later_path_overrides_earlier(tmp_path: Path):
     assert len(shared) == 1
     assert shared[0].source_path is not None
     assert str(path_b) in shared[0].source_path
+
+
+class TestLoadFilesystemSkills:
+    """Tests for the load-health signal the HolmesCustomSkills mirror prunes on.
+
+    An empty skill list is ambiguous on its own: it means either "the user deleted their
+    last skill" or "nothing could be read". The mirror deletes rows based on what loaded, so
+    conflating the two either leaves a stale skill visible forever or wipes the UI's view on
+    a transient mount failure. `sources_ok` is what separates them.
+    """
+
+    def test_clean_load_reports_ok(self, tmp_path: Path):
+        _write_skill(tmp_path / "alpha", "alpha")
+
+        loaded = load_filesystem_skills(custom_skill_paths=[tmp_path])
+
+        assert loaded.sources_ok is True
+        assert [s.name for s in loaded.skills] == ["alpha"]
+
+    def test_readable_but_empty_directory_reports_ok(self, tmp_path: Path):
+        """The case that must prune: the directory is fine, it just has no skills left."""
+        empty = tmp_path / "empty"
+        empty.mkdir()
+
+        loaded = load_filesystem_skills(custom_skill_paths=[empty])
+
+        assert loaded.sources_ok is True
+        assert loaded.skills == []
+
+    def test_missing_directory_reports_not_ok(self, tmp_path: Path):
+        loaded = load_filesystem_skills(
+            custom_skill_paths=[tmp_path / "does-not-exist"]
+        )
+
+        assert loaded.sources_ok is False
+        assert loaded.skills == []
+
+    def test_unparseable_skill_reports_not_ok(self, tmp_path: Path):
+        """A malformed SKILL.md is skipped by the loader, so without the health signal this
+        would look identical to a directory that legitimately holds no skills."""
+        broken = tmp_path / "broken"
+        broken.mkdir()
+        (broken / "SKILL.md").write_text("no frontmatter here")
+
+        loaded = load_filesystem_skills(custom_skill_paths=[tmp_path])
+
+        assert loaded.sources_ok is False
+        assert loaded.skills == []
+
+    def test_path_that_is_neither_dir_nor_skill_md_reports_not_ok(self, tmp_path: Path):
+        stray = tmp_path / "notes.txt"
+        stray.write_text("hello")
+
+        loaded = load_filesystem_skills(custom_skill_paths=[stray])
+
+        assert loaded.sources_ok is False
+
+    def test_partial_failure_still_returns_the_readable_skills(self, tmp_path: Path):
+        """Conservative rule: a good path still loads, but the bad one taints sources_ok so
+        the caller will not prune the skills the failed path would have provided."""
+        good = tmp_path / "good"
+        _write_skill(good / "alpha", "alpha")
+
+        loaded = load_filesystem_skills(
+            custom_skill_paths=[good, tmp_path / "missing"]
+        )
+
+        assert loaded.sources_ok is False
+        assert [s.name for s in loaded.skills] == ["alpha"]
+
+    def test_does_not_read_supabase(self, tmp_path: Path):
+        """Global and personal skills live in HolmesRunbooks and must not be mirrored."""
+        _write_skill(tmp_path / "alpha", "alpha")
+
+        loaded = load_filesystem_skills(custom_skill_paths=[tmp_path])
+
+        assert all(
+            s.source in (SkillSource.USER, SkillSource.BUILTIN) for s in loaded.skills
+        )

@@ -168,14 +168,25 @@ def parse_skill_file(path: Path, source: SkillSource = SkillSource.USER) -> Skil
 
 
 def scan_skill_directory(
-    directory: Path, source: SkillSource = SkillSource.USER, max_depth: int = 2
+    directory: Path,
+    source: SkillSource = SkillSource.USER,
+    max_depth: int = 2,
+    problems: Optional[List[str]] = None,
 ) -> List[Skill]:
-    """Scan a directory for SKILL.md files up to max_depth levels deep."""
+    """Scan a directory for SKILL.md files up to max_depth levels deep.
+
+    When `problems` is passed, every source that could not be read is appended to it. That
+    is what lets a caller tell "this directory really holds no skills" apart from "this
+    directory could not be read", which an empty return value alone cannot express. Callers
+    that DELETE based on what loaded need the distinction; see load_filesystem_skills.
+    """
     skills: List[Skill] = []
     directory = directory.resolve()
 
     if not directory.is_dir():
         logging.warning(f"Skill directory does not exist: {directory}")
+        if problems is not None:
+            problems.append(f"skill directory does not exist: {directory}")
         return skills
 
     # followlinks=True so we traverse Kubernetes ConfigMap mounts, which
@@ -201,6 +212,8 @@ def scan_skill_directory(
                 skills.append(skill)
             except Exception as e:
                 logging.error(f"Failed to parse {skill_path}: {e}")
+                if problems is not None:
+                    problems.append(f"failed to parse {skill_path}: {e}")
 
     return skills
 
@@ -232,6 +245,107 @@ def map_robusta_instruction_to_skill(
         source_path=instr.id,
         display_name=instr.title,
         alerts=instr.alerts,
+    )
+
+
+class FilesystemSkills(BaseModel):
+    """Builtin + filesystem skills, plus whether every configured source was readable.
+
+    `sources_ok` is False when any skill source could not be read: a missing directory, a
+    path that is neither a directory nor a SKILL.md, or a SKILL.md that failed to parse.
+
+    This exists because an empty skill list is ambiguous on its own -- it means either "there
+    genuinely are no skills" or "nothing could be read". A caller that only ADDS rows can
+    ignore the difference, but a caller that DELETES based on what loaded cannot: treating a
+    failed load as authoritative would prune rows for skills that are still on disk.
+    """
+
+    skills: List[Skill]
+    sources_ok: bool
+
+
+def _load_filesystem_skills_by_name(
+    custom_skill_paths: Optional[List[Union[str, Path]]] = None,
+    problems: Optional[List[str]] = None,
+) -> dict[str, Skill]:
+    """Load builtin skills, then filesystem skills which override builtins by name.
+
+    Shared by load_skill_catalog and load_filesystem_skills so the override and
+    error-handling rules cannot drift between the prompt catalog and the UI mirror.
+    Unreadable sources are appended to `problems` when it is provided.
+    """
+    skills_by_name: dict[str, Skill] = {}
+
+    # 1. Load builtin skills. A missing builtin dir is not recorded as a problem: it ships
+    # with the package and is not what the mirror prunes on.
+    builtin_dir = Path(BUILTIN_SKILLS_DIR)
+    if builtin_dir.is_dir():
+        for skill in scan_skill_directory(
+            builtin_dir, source=SkillSource.BUILTIN, problems=problems
+        ):
+            skills_by_name[skill.name] = skill
+
+    # 2. Load user skills from custom_skill_paths (overrides builtins)
+    if custom_skill_paths:
+        for skill_path in custom_skill_paths:
+            path = Path(str(skill_path))
+            if path.is_dir():
+                for skill in scan_skill_directory(
+                    path, source=SkillSource.USER, problems=problems
+                ):
+                    if skill.name in skills_by_name:
+                        logging.warning(
+                            f"Skill '{skill.name}' from {skill.source_path} "
+                            f"overrides {skills_by_name[skill.name].source_path}"
+                        )
+                    skills_by_name[skill.name] = skill
+            elif path.is_file() and path.name == SKILL_FILENAME:
+                try:
+                    skill = parse_skill_file(path, source=SkillSource.USER)
+                    if skill.name in skills_by_name:
+                        logging.warning(
+                            f"Skill '{skill.name}' from {skill.source_path} "
+                            f"overrides {skills_by_name[skill.name].source_path}"
+                        )
+                    skills_by_name[skill.name] = skill
+                except Exception as e:
+                    logging.error(f"Failed to parse skill file {path}: {e}")
+                    if problems is not None:
+                        problems.append(f"failed to parse skill file {path}: {e}")
+            else:
+                logging.warning(f"Skill path is not a directory or SKILL.md file: {path}")
+                if problems is not None:
+                    problems.append(
+                        f"skill path is not a directory or {SKILL_FILENAME} file: {path}"
+                    )
+
+    return skills_by_name
+
+
+def load_filesystem_skills(
+    custom_skill_paths: Optional[List[Union[str, Path]]] = None,
+) -> FilesystemSkills:
+    """Load only the builtin + filesystem skills, reporting whether every source was read.
+
+    Deliberately does not touch Supabase: global and personal skills live in HolmesRunbooks
+    and must not be mirrored into HolmesCustomSkills.
+
+    Unlike load_skill_catalog this returns an empty list rather than None for "no skills",
+    because for the mirror an empty result is a meaningful state (prune everything) as long
+    as `sources_ok` is True.
+    """
+    problems: List[str] = []
+    skills_by_name = _load_filesystem_skills_by_name(custom_skill_paths, problems)
+
+    if problems:
+        logging.warning(
+            "%d skill source(s) could not be read; treating this load as incomplete: %s",
+            len(problems),
+            "; ".join(problems),
+        )
+
+    return FilesystemSkills(
+        skills=list(skills_by_name.values()), sources_ok=not problems
     )
 
 
@@ -317,39 +431,8 @@ def load_skill_catalog(
     When absent (chat, CLI) nothing is filtered -- alert-scoped skills are still offered, with
     their alert names in the description so the model can weigh them.
     """
-    skills_by_name: dict[str, Skill] = {}
-
-    # 1. Load builtin skills
-    builtin_dir = Path(BUILTIN_SKILLS_DIR)
-    if builtin_dir.is_dir():
-        for skill in scan_skill_directory(builtin_dir, source=SkillSource.BUILTIN):
-            skills_by_name[skill.name] = skill
-
-    # 2. Load user skills from custom_skill_paths (overrides builtins)
-    if custom_skill_paths:
-        for skill_path in custom_skill_paths:
-            path = Path(str(skill_path))
-            if path.is_dir():
-                for skill in scan_skill_directory(path, source=SkillSource.USER):
-                    if skill.name in skills_by_name:
-                        logging.warning(
-                            f"Skill '{skill.name}' from {skill.source_path} "
-                            f"overrides {skills_by_name[skill.name].source_path}"
-                        )
-                    skills_by_name[skill.name] = skill
-            elif path.is_file() and path.name == SKILL_FILENAME:
-                try:
-                    skill = parse_skill_file(path, source=SkillSource.USER)
-                    if skill.name in skills_by_name:
-                        logging.warning(
-                            f"Skill '{skill.name}' from {skill.source_path} "
-                            f"overrides {skills_by_name[skill.name].source_path}"
-                        )
-                    skills_by_name[skill.name] = skill
-                except Exception as e:
-                    logging.error(f"Failed to parse skill file {path}: {e}")
-            else:
-                logging.warning(f"Skill path is not a directory or SKILL.md file: {path}")
+    # 1 + 2. Builtin skills, then filesystem skills (which override builtins by name)
+    skills_by_name = _load_filesystem_skills_by_name(custom_skill_paths)
 
     # 3. Load remote (global) skills from Supabase
     if dal:

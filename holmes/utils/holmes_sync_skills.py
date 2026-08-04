@@ -5,7 +5,7 @@ from holmes.config import Config
 from holmes.core.supabase_dal import SupabaseDal
 from holmes.plugins.skills.skill_loader import (
     SkillSource,
-    load_skill_catalog,
+    load_filesystem_skills,
 )
 
 # How a SkillSource is labelled in the HolmesCustomSkills.source column. Every filesystem
@@ -25,9 +25,10 @@ def holmes_sync_skills_status(dal: SupabaseDal, config: Config) -> None:
     keeps executing these from disk. Runs at startup and on the periodic refresh, alongside
     holmes_sync_toolsets_status.
 
-    Deliberately loads with dal=None so only builtin + filesystem skills are collected --
+    Loads through load_filesystem_skills so only builtin + filesystem skills are collected --
     global and personal skills already live in HolmesRunbooks and must not be duplicated
-    into the mirror.
+    into the mirror. That loader also reports whether every source was readable, which is
+    what makes it safe to prune on an empty result.
 
     Best-effort: any failure is logged and swallowed, because a display-only mirror must
     never prevent Holmes from starting.
@@ -37,12 +38,10 @@ def holmes_sync_skills_status(dal: SupabaseDal, config: Config) -> None:
             logging.warning("Cluster name is missing; skipping custom skills sync.")
             return
 
-        catalog = load_skill_catalog(
-            dal=None, custom_skill_paths=config.custom_skill_paths
-        )
-        if not catalog or not catalog.skills:
-            logging.debug("No filesystem or builtin skills found to sync.")
-            return
+        # Reports whether every skill source was readable, which the prune below depends on.
+        # An empty result alone cannot distinguish "the last skill was deleted" from "the
+        # ConfigMap is not mounted yet" -- and only the first should prune the mirror.
+        loaded = load_filesystem_skills(config.custom_skill_paths)
 
         # UTC-aware: a naive timestamp would be interpreted in the database session's
         # timezone, so updated_at would not reflect the real sync time off-UTC.
@@ -62,10 +61,14 @@ def holmes_sync_skills_status(dal: SupabaseDal, config: Config) -> None:
                 "error": None,
                 "updated_at": updated_at,
             }
-            for skill in catalog.skills
+            for skill in loaded.skills
             if skill.source in SOURCE_LABELS
         ]
 
-        dal.sync_skills(rows, config.cluster_name)
+        # Conservative: prune only when EVERY source was readable. A partially-readable load
+        # must not delete the rows for the part that failed, and a fully-unreadable one must
+        # not wipe the list -- while a clean load of zero skills genuinely means "the last
+        # skill was deleted" and must prune.
+        dal.sync_skills(rows, config.cluster_name, prune=loaded.sources_ok)
     except Exception:
         logging.exception("Failed to sync custom skills", exc_info=True)
